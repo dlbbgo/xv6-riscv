@@ -125,6 +125,12 @@ found:
   p->pid = allocpid();
   p->state = USED;
 
+  // Initialize the ticks and tickets
+  p->ticks = 0;         // Initialize the tick count to 0
+  p->tickets = 10000;       // Initialize the ticket count to a default value, say 1
+  p->pass = 0;
+
+
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
     freeproc(p);
@@ -441,6 +447,17 @@ wait(uint64 addr)
 //  - swtch to start running that process.
 //  - eventually that process transfers control
 //    via swtch back to the scheduler.
+
+
+// pseudo random generator (https://stackoverflow.com/a/7603688)
+unsigned short lfsr = 0xACE1u;
+unsigned short bit;
+unsigned short rand(){
+  bit = ((lfsr >> 0) ^ (lfsr >> 2) ^ (lfsr >> 3) ^ (lfsr >> 5)) & 1;
+  return lfsr = (lfsr >> 1) | (bit << 15);
+}
+
+
 void
 scheduler(void)
 {
@@ -452,22 +469,86 @@ scheduler(void)
     // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
 
-    for(p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
+    #if defined(LOTTERY) // Lottery scheduler logic
+      
+      // Calculate total tickets number
+      int total_tickets = 0;
+      for(p = proc; p < &proc[NPROC]; p++) {
+        acquire(&p->lock);
+        if(p->state == RUNNABLE)
+          total_tickets += p->tickets;
+        release(&p->lock);
       }
+
+      if(total_tickets > 0){
+        unsigned short selected_ticket = rand() % total_tickets;
+        int tickets_accumulate = 0;
+        for(p = proc; p < &proc[NPROC]; p++) {
+          acquire(&p->lock);
+          if(p->state == RUNNABLE) {
+            tickets_accumulate += p->tickets;
+            if(tickets_accumulate > selected_ticket){
+              p->ticks++;
+              p->state = RUNNING;
+              c->proc = p;
+              swtch(&c->context, &p->context);
+              c->proc = 0;
+              release(&p->lock);
+              break;
+            }
+          }
+          release(&p->lock);
+        }
+      }
+
+
+
+    #elif defined(STRIDE)
+      int K = 10000;
+      int index = 0;
+      
+      for(uint64 i = 1; i < NPROC; i++) {
+        p = &proc[i];
+        acquire(&p->lock);
+        if(p->state == RUNNABLE && p->pass < proc[index].pass) {
+          index = i;
+        }
+        release(&p->lock);
+      }
+      p = &proc[index];
+      acquire(&p->lock);
+      
+      p->pass += (K / p->tickets);
+      p->ticks++;
+      p->state = RUNNING;
+      c->proc = p;
+      swtch(&c->context, &p->context);
+      c->proc = 0;
+      
       release(&p->lock);
-    }
+      
+    #else
+      for(p = proc; p < &proc[NPROC]; p++) {
+        
+        acquire(&p->lock);
+        if(p->state == RUNNABLE) {
+          // Switch to chosen process.  It is the process's job
+          // to release its lock and then reacquire it
+          // before jumping back to us.
+          p->state = RUNNING;
+          // Increment ticks each time the process is about to run
+          p->ticks++;
+          c->proc = p;
+          swtch(&c->context, &p->context);
+
+          // Process is done running for now.
+          // It should have changed its p->state before coming back.
+          c->proc = 0;
+        }
+        release(&p->lock);
+      }
+
+    #endif
   }
 }
 
@@ -680,4 +761,37 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+int
+sched_statistics(void)
+{
+    struct proc *p;
+
+    for(p = proc; p < &proc[NPROC]; p++){
+        acquire(&p->lock);
+        if(p->state != UNUSED) {
+            printf("%d (%s): tickets: %d, scheduled: %d\n", 
+                  p->pid, p->name, p->tickets, p->ticks);
+        }
+        release(&p->lock);
+    }
+
+    return 0;
+}
+
+int
+sched_tickets(int n)
+{
+    struct proc *p = myproc();
+
+    acquire(&p->lock);
+    if(n < 0 || n > 10000) {
+        release(&p->lock);
+        return -1;
+    }
+
+    p->tickets = n;
+    release(&p->lock);
+    return 0;
 }
